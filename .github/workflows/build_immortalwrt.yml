@@ -109,10 +109,10 @@ jobs:
           sudo rm -rf /var/lib/apt/lists/* /var/cache/apt/*
 
       - name: 克隆当前仓库 (Clone current repo)
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: 克隆 openWRT 仓库 (Clone openWRT repo)
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           repository: "${{inputs.owner}}/${{inputs.repo}}"
           ref: ${{inputs.branch}}
@@ -152,7 +152,7 @@ jobs:
 
       - name: 启用ssh生成了.config后在编译前上传配置(Upload config before build)
         if: ${{inputs.ssh == true}}
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: config-before-build
           path: |
@@ -175,7 +175,7 @@ jobs:
         run: make -j1 V=s
 
       - name: 上传编译结果到 Artifact (Upload build result to Artifact)
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: openWRT-build-result
           path: openWRT/bin/targets
