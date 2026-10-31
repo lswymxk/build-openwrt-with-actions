@@ -62,19 +62,46 @@ jobs:
           homebrew_clean: "True"
           npm_prune: "True"
           npm_clean: "True"
-          os_swap: "True"
+          # os_swap: "True"
+          # 单盘布局会跳过 maximize-build-space，那时候不会再创建 swap LV；
+          # 把这里改回 False 才能保留镜像自带的 swap 文件（openwrt 链接大文件时有用）。
+          os_swap: "False"
+
+           # ============================================================================
+      # 关键修改点 0：ubuntu-latest 现在会随机分配「单盘 145G」或「双盘 72G + 74G(/mnt)」
+      #   单盘布局下 /mnt 和 / 是同一个文件系统，maximize-build-space 会做两次 fallocate：
+      #     ① 根分区砍到只剩 root-reserve-mb
+      #     ② 再把 /mnt（其实是同一个根分区）砍到只剩 temp-reserve-mb（默认 100MB）
+      #   结果根分区只剩 100MB，apt 连 90MB 的 deb 都下不动，就是这次的报错。
+      #   所以：单盘时干脆跳过它（145G 足够），双盘时才合并。
+      # ============================================================================
+      - name: 检测磁盘布局 (Detect disk layout)
+        id: disk
+        run: |
+          df -hT /
+          ROOT_DEV="$(df -P / | awk 'NR==2{print $1}')"
+          MNT_DEV="$(df -P /mnt 2>/dev/null | awk 'NR==2{print $1}')"
+          if [ -z "$MNT_DEV" ] || [ "$MNT_DEV" = "$ROOT_DEV" ]; then
+            echo "layout=single" >> "$GITHUB_OUTPUT"
+            echo "::notice::单盘布局（/mnt 与 / 同一文件系统），跳过 maximize-build-space，直接使用 145G 根盘"
+          else
+            echo "layout=dual" >> "$GITHUB_OUTPUT"
+            echo "::notice::双盘布局，合并 / 与 /mnt"
+          fi
 
       - name: Freeing up disk space
+        if: steps.disk.outputs.layout == 'dual'
         uses: easimon/maximize-build-space@master
         with:
-          root-reserve-mb: 3072
-          swap-size-mb: 1
+          root-reserve-mb: 8192      # 必须 > temp-reserve-mb，否则单盘时第二次 fallocate 为负
+          temp-reserve-mb: 4096      # 默认只有 100MB，是这次 / 被榨干的元凶
+          swap-size-mb: 2048         # 原来是 1（1MB swap 没有意义，多半是笔误）
           remove-dotnet: "true"
           remove-android: "true"
           remove-haskell: "true"
           remove-codeql: "true"
           remove-docker-images: "true"
-
+          
       - name: Free up disk space complete
         run: |
           echo "Free up disk space complete"
