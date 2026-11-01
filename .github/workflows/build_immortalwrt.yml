@@ -60,29 +60,35 @@ jobs:
           df -hT
           echo "=============================================================================="
 
-      # 【改】os_swap 由 True 改成 False：
-      #   单盘布局会跳过下面的 maximize-build-space，那时不会再生成 swap LV，
-      #   保留镜像自带的 swap 文件（openwrt 链接大文件时有用）。
-      - name: "Optimize Disk Space"
-        uses: "hugoalh/disk-space-optimizer-ghaction@v0.8.1"
-        with:
-          operate_sudo: "True"
-          general_include: ".+"
-          general_exclude: |-
-            ^GCC$
-            ^G\+\+$
-            Clang
-            LLVM
-          docker_include: ".+"
-          docker_prune: "True"
-          docker_clean: "True"
-          apt_prune: "True"
-          apt_clean: "True"
-          homebrew_prune: "True"
-          homebrew_clean: "True"
-          npm_prune: "True"
-          npm_clean: "True"
-          os_swap: "False"
+      # 【改】用等价的手写清理，替换 hugoalh/disk-space-optimizer-ghaction@v0.8.1
+      #
+      # 为什么换掉：Ubuntu 26.04 的 sudo 换成了 sudo-rs，它不支持 --preserve-env
+      #   （日志：sudo: preserving the entire environment is not supported, '--preserve-env' is ignored），
+      #   而这个 action 内部是用 `sudo --preserve-env pwsh main.ps1` 跑的，
+      #   环境变量过不去 → $Env:INPUT_ALLOWPRERELEASE 为空 →
+      #   [Boolean]::Parse('') 抛异常 → PowerShell 工具箱装不上 →
+      #   Import-Module 'hugoalh.GitHubActionsToolkit' 失败 →
+      #   整个 action 一步实际清理都没做（内部写了 continue-on-error，所以外层还是绿勾）。
+      #
+      # 手写版做的是同样的事：删大件、清 apt/docker 缓存，输出清理前后的 df 便于对比。
+      - name: 清理无用软件，腾出磁盘空间 (Clean up disk space)
+        run: |
+          echo "=== 清理前 ==="
+          df -hT / | tail -1
+
+          # ① 删掉 runner 镜像里体积最大且本项目用不到的东西（约 25~30GB）
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android \
+                      /opt/hostedtoolcache/CodeQL /usr/local/share/boost || true
+
+          # ② Docker 镜像缓存
+          sudo docker image prune --all --force 2>/dev/null || true
+
+          # ③ APT 缓存与包列表
+          sudo apt-get clean || true
+          sudo rm -rf /var/lib/apt/lists/* /var/cache/apt/* || true
+
+          echo "=== 清理后 ==="
+          df -hT / | tail -1
 
       # 【改】先探测磁盘布局：单盘(/mnt 与 / 同一文件系统) 还是 双盘(/dev/sdb1 挂 /mnt)
       #   原因：maximize-build-space 会对 / 和 /mnt 各做一次 fallocate，
