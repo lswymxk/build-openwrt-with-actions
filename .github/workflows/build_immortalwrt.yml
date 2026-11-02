@@ -28,7 +28,7 @@ on:
         description: "openWRT 仓库的分支 (Branch of openWRT repo)"
         type: string
         required: true
-        default: "openwrt-25.12"
+        default: "openwrt-24.10"
       multithreading:
         description: "开启多线程编译 (Enable multithreading build)"
         type: boolean
@@ -153,8 +153,11 @@ jobs:
             ninja-build p7zip p7zip-full patch pkgconf python3 python3-pip python3-ply python3-docutils \
             python3-pyelftools qemu-utils re2c rsync scons squashfs-tools subversion swig texinfo uglifyjs \
             upx-ucl unzip vim wget xmlto xxd zlib1g-dev zstd
-          # 4️⃣ 如果开启了 CONFIG_KERNEL_DEBUG_INFO_BTF，取消下面这行注释（pahole 由 dwarves 提供）
-          # sudo apt-get install -y --no-install-recommends dwarves
+          # 4️⃣ 关于 pahole：开启 CONFIG_KERNEL_DEBUG_INFO_BTF 后 **不需要** 在这里装 dwarves。
+          #    OpenWrt 的 KERNEL_DEBUG_INFO_BTF 带 select DWARVES（toolchain/dwarves），
+          #    构建时会自动编译 host 版 pahole，内核构建用的是
+          #    staging_dir/host/bin/pahole（PATH 里排在 /usr/bin 前面），
+          #    跟系统里有没有 pahole 无关。装了也无害，只是白白多下几 MB。
 
           sudo apt-get clean
           sudo rm -rf /var/lib/apt/lists/* /var/cache/apt/*
@@ -258,8 +261,10 @@ jobs:
       # 第 3 步：注入内核选项
       #   CONFIG_KERNEL_xxx 必须放在 defconfig 之后，否则会被 defconfig 重写时丢掉。
       #   直接写 CONFIG_XDP_SOCKETS=y 无效，OpenWrt 只认 CONFIG_KERNEL_ 前缀。
+      #   grep 要连 "# CONFIG_KERNEL_xxx is not set" 一起匹配，
+      #   否则 DEBUG_INFO_REDUCED 的那行会漏掉 → BTF 被内核 oldconfig 丢弃。
       - name: 注入内核 XDP/eBPF 选项（defconfig 之后）
-        run: grep '^CONFIG_KERNEL_' mlx5-xdp.config >> openWRT/.config
+        run: grep -E '^(# )?CONFIG_KERNEL_' mlx5-xdp.config >> openWRT/.config
 
       # 校验：确认注入没被丢弃（包不存在 / 依赖不满足时会静默消失）
       - name: 校验配置注入结果
@@ -268,16 +273,25 @@ jobs:
           echo "--- 软件包 ---"
           miss=0
           for p in kmod-mlx5-core kmod-mlxfw ethtool lm-sensors pciutils \
-                   irqbalance bpftool-minimal libxdp xdp-loader xdp-filter xdpdump \
-                   tc-bpf kmod-sched-core kmod-sched-bpf; do
+                   irqbalance bpftool-full libxdp xdp-loader xdp-filter xdpdump \
+                   tc-bpf kmod-sched-core kmod-xdp-sockets-diag; do
             if grep -q "^CONFIG_PACKAGE_$p=y" .config; then
               echo "OK   $p"
             else
               echo "MISS $p"; miss=1
             fi
           done
+          echo "--- 构建开关 ---"
+          grep -q '^CONFIG_DEVEL=y' .config && echo "OK   DEVEL" || { echo "MISS DEVEL"; miss=1; }
+          grep -q '^CONFIG_BPF_TOOLCHAIN_HOST=y' .config && echo "OK   BPF_TOOLCHAIN_HOST" || { echo "MISS BPF_TOOLCHAIN_HOST"; miss=1; }
           echo "--- 内核选项 ---"
-          grep -E '^CONFIG_KERNEL_(XDP_SOCKETS|CGROUP_BPF|NET_CLS_BPF|NET_ACT_BPF|NET_SCH_INGRESS|BPF_JIT_ALWAYS_ON)=' .config || miss=1
+          grep -E '^CONFIG_KERNEL_(BPF_SYSCALL|BPF_JIT|BPF_JIT_ALWAYS_ON|CGROUP_BPF|BPF_EVENTS|XDP_SOCKETS|NET_CLS_BPF|NET_ACT_BPF|NET_SCH_INGRESS|DEBUG_INFO|DEBUG_INFO_BTF)=' .config || miss=1
+          # DEBUG_INFO_REDUCED 必须是关的，否则 BTF 会被内核丢弃
+          if grep -q '^CONFIG_KERNEL_DEBUG_INFO_REDUCED=y' .config; then
+            echo "!! DEBUG_INFO_REDUCED 仍是 y，BTF 会失效"; miss=1
+          else
+            echo "OK   DEBUG_INFO_REDUCED 未启用"
+          fi
           # 驱动是硬需求：没有 mlx5 就编不出能用的固件，直接失败
           grep -q '^CONFIG_PACKAGE_kmod-mlx5-core=y' .config || { echo "!! 缺少 mlx5 驱动"; exit 1; }
           exit $miss
@@ -302,7 +316,10 @@ jobs:
         run: |
           KCFG=$(ls build_dir/target-*/linux-*/linux-*/.config 2>/dev/null | head -1)
           [ -n "$KCFG" ] || { echo "没有找到内核 .config（可能没编译到内核阶段）"; exit 0; }
-          grep -E '^CONFIG_(MLX5_CORE|BPF_SYSCALL|BPF_JIT|BPF_JIT_ALWAYS_ON|CGROUP_BPF|NET_CLS_BPF|NET_ACT_BPF|XDP_SOCKETS)=' "$KCFG" || true
+          grep -E '^CONFIG_(MLX5_CORE|BPF_SYSCALL|BPF_JIT|BPF_JIT_ALWAYS_ON|CGROUP_BPF|BPF_EVENTS|NET_CLS_BPF|NET_ACT_BPF|NET_SCH_INGRESS|XDP_SOCKETS|DEBUG_INFO|DEBUG_INFO_BTF)=' "$KCFG" || true
+          echo "--- 关键点检查 ---"
+          grep -q '^CONFIG_DEBUG_INFO_BTF=y' "$KCFG" && echo "OK   BTF 已编入" || echo "!! BTF 没编进去（检查 DEBUG_INFO_REDUCED 是否被关掉）"
+          grep -q '^CONFIG_DEBUG_INFO_REDUCED=y' "$KCFG" && echo "!! DEBUG_INFO_REDUCED=y，BTF 会被丢弃" || true
 
       # 【改】upload-artifact@v4 → v6（v4/v5 都还是 node20）
       - name: 上传编译结果到 Artifact (Upload build result to Artifact)
