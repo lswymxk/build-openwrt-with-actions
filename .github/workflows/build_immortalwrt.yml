@@ -28,7 +28,7 @@ on:
         description: "openWRT 仓库的分支 (Branch of openWRT repo)"
         type: string
         required: true
-        default: "openwrt-25.12"
+        default: "openwrt-24.10"
       multithreading:
         description: "开启多线程编译 (Enable multithreading build)"
         type: boolean
@@ -274,7 +274,8 @@ jobs:
           miss=0
           for p in kmod-mlx5-core kmod-mlxfw ethtool lm-sensors pciutils \
                    irqbalance bpftool-full libxdp xdp-loader xdp-filter xdpdump \
-                   tc-bpf kmod-sched-core kmod-xdp-sockets-diag; do
+                   tc-bpf kmod-sched-core kmod-sched-bpf kmod-xdp-sockets-diag \
+                   kmod-veth kmod-nft-queue kmod-nfnetlink-queue; do
             if grep -q "^CONFIG_PACKAGE_$p=y" .config; then
               echo "OK   $p"
             else
