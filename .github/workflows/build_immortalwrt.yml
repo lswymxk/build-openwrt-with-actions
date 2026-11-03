@@ -25,10 +25,10 @@ on:
         required: true
         default: "immortalwrt"
       branch:
-        description: "openWRT 仓库的分支 (Branch of openWRT repo)"
+        description: "openWRT 仓库的分支或 tag（填 v25.12.2 这类 tag 才会编出稳定版；填 openwrt-25.12 则是最新稳定分支代码）"
         type: string
         required: true
-        default: "openwrt-24.10"
+        default: "v25.12.2"
       multithreading:
         description: "开启多线程编译 (Enable multithreading build)"
         type: boolean
@@ -169,12 +169,17 @@ jobs:
       - name: 克隆当前仓库 (Clone current repo)
         uses: actions/checkout@v5
 
+      # 【改】要编 stable 版本，这里要传「tag」而不是「分支」：
+      #   branch 输入填 v25.12.2（tag 名以 https://github.com/immortalwrt/immortalwrt/tags 为准）
+      #   分支 openwrt-25.12 会一直往前跑，编出来就不是 25.12.2 那一刻的代码。
+      #   版本号由 mlx5-xdp.config 显式写入，所以不需要 git 历史/标签，保持浅克隆即可。
       - name: 克隆 openWRT 仓库 (Clone openWRT repo)
         uses: actions/checkout@v5
         with:
           repository: "${{inputs.owner}}/${{inputs.repo}}"
           ref: ${{inputs.branch}}
           path: openWRT
+          fetch-depth: 1
 
       # ---------------------------------------------------------------------
       # 配置注入
@@ -259,12 +264,53 @@ jobs:
         run: make defconfig
 
       # 第 3 步：注入内核选项
-      #   CONFIG_KERNEL_xxx 必须放在 defconfig 之后，否则会被 defconfig 重写时丢掉。
+      #   CONFIG_KERNEL_xxx 必须在 defconfig 之后，否则会被 defconfig 重写时丢掉。
       #   直接写 CONFIG_XDP_SOCKETS=y 无效，OpenWrt 只认 CONFIG_KERNEL_ 前缀。
       #   grep 要连 "# CONFIG_KERNEL_xxx is not set" 一起匹配，
       #   否则 DEBUG_INFO_REDUCED 的那行会漏掉 → BTF 被内核 oldconfig 丢弃。
-      - name: 注入内核 XDP/eBPF 选项（defconfig 之后）
+      - name: 注入内核选项（defconfig 之后）
         run: grep -E '^(# )?CONFIG_KERNEL_' mlx5-xdp.config >> openWRT/.config
+
+      # 第 4 步：按 branch 推导版本号，保证「标签 == 实际代码」
+      #   v25.12.2       → 25.12.2          + releases/25.12.2
+      #   openwrt-25.12  → 25.12 SNAPSHOT   + snapshots
+      #   main / master  → SNAPSHOT         + snapshots
+      # 版本号也必须在 defconfig 之后写入（否则会被 kconfig 重写丢掉）。
+      - name: 按 branch 写入版本号 (Derive version from ref)
+        run: |
+          BRANCH="${{ inputs.branch }}"
+          case "$BRANCH" in
+            v[0-9]*.[0-9]*.[0-9]*)
+              RAW="${BRANCH#v}"          # 25.12.2 / 25.12.2-immortalwrt
+              CORE="${RAW%%-*}"          # 25.12.2
+              VER="$RAW"
+              REPO="https://downloads.immortalwrt.org/releases/${CORE}"
+              ;;
+            v[0-9]*.[0-9]*)
+              # 万一 tag 只有两段（如 v25.12），也按 release 处理
+              VER="${BRANCH#v}"
+              REPO="https://downloads.immortalwrt.org/releases/${VER}"
+              ;;
+            openwrt-[0-9]*.[0-9]*)
+              VER="${BRANCH#openwrt-} SNAPSHOT"   # 25.12 SNAPSHOT
+              REPO="https://downloads.immortalwrt.org/snapshots"
+              ;;
+            *)
+              VER="SNAPSHOT"
+              REPO="https://downloads.immortalwrt.org/snapshots"
+              ;;
+          esac
+          CODE="$(git -C openWRT rev-parse --short HEAD 2>/dev/null || echo '')"
+          {
+            echo "CONFIG_VERSION_NUMBER=\"$VER\""
+            echo "CONFIG_VERSION_CODE=\"$CODE\""
+            echo "CONFIG_VERSION_REPO=\"$REPO\""
+            echo "CONFIG_VERSION_DIST=\"ImmortalWrt\""
+          } >> openWRT/.config
+          echo "ref     = $BRANCH"
+          echo "VERSION = $VER"
+          echo "REPO    = $REPO"
+          echo "CODE    = $CODE"
 
       # 校验：确认注入没被丢弃（包不存在 / 依赖不满足时会静默消失）
       - name: 校验配置注入结果
@@ -292,6 +338,12 @@ jobs:
             echo "!! DEBUG_INFO_REDUCED 仍是 y，BTF 会失效"; miss=1
           else
             echo "OK   DEBUG_INFO_REDUCED 未启用"
+          fi
+          echo "--- 版本号 ---"
+          if grep -q '^CONFIG_VERSION_NUMBER="' .config; then
+            grep '^CONFIG_VERSION_' .config
+          else
+            echo "MISS CONFIG_VERSION_NUMBER（镜像会显示 Snapshots）"; miss=1
           fi
           # 驱动是硬需求：没有 mlx5 就编不出能用的固件，直接失败
           grep -q '^CONFIG_PACKAGE_kmod-mlx5-core=y' .config || { echo "!! 缺少 mlx5 驱动"; exit 1; }
