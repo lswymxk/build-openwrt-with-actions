@@ -1,3 +1,14 @@
+# =============================================================================
+# ImmortalWrt 编译工作流（.config 注入版）
+#
+# 相比原版改动（都在下面用【改】标出）：
+#   1. 磁盘：ubuntu-latest 会随机分配单盘/双盘，单盘时跳过 maximize-build-space
+#   2. 版本：checkout@v5 / upload-artifact@v6（旧版是 node20，会被强制跑在 node24 上）
+#   3. 配置：编译前 make defconfig 补齐依赖；再用 mlx5-xdp.config 分两次注入
+#      - CONFIG_PACKAGE_* 在 defconfig 之前注入（否则依赖不解析 → Error 9）
+#      - CONFIG_KERNEL_*  在 defconfig 之后注入（否则被 defconfig 丢掉）
+#   4. SSH：upterm，失败不阻断编译；网络封锁 22 端口时可改走 wss://（443）
+# =============================================================================
 name: 🚀 编译 immortalwrt(Build immortalwrt)
 
 on:
@@ -14,10 +25,10 @@ on:
         required: true
         default: "immortalwrt"
       branch:
-        description: "openWRT 仓库的分支 (Branch of openWRT repo)"
+        description: "openWRT 仓库的分支或 tag（填 v25.12.2 这类 tag 才会编出稳定版；填 openwrt-25.12 则是最新稳定分支代码）"
         type: string
         required: true
-        default: "openwrt-24.10"
+        default: "v25.12.2"
       multithreading:
         description: "开启多线程编译 (Enable multithreading build)"
         type: boolean
@@ -35,7 +46,13 @@ jobs:
   build:
     runs-on: ubuntu-latest
     name: 🚀 编译 (Build)
+    # 兜底超时，防止 SSH 步骤或编译卡死把额度耗光
+    timeout-minutes: 360
+
     steps:
+      # ---------------------------------------------------------------------
+      # 磁盘准备
+      # ---------------------------------------------------------------------
       - name: Before freeing up disk space
         run: |
           echo "Before freeing up disk space"
@@ -43,38 +60,40 @@ jobs:
           df -hT
           echo "=============================================================================="
 
-      - name: "Optimize Disk Space"
-        uses: "hugoalh/disk-space-optimizer-ghaction@v0.8.1"
-        with:
-          operate_sudo: "True"
-          general_include: ".+"
-          general_exclude: |-
-            ^GCC$
-            ^G\+\+$
-            Clang
-            LLVM
-          docker_include: ".+"
-          docker_prune: "True"
-          docker_clean: "True"
-          apt_prune: "True"
-          apt_clean: "True"
-          homebrew_prune: "True"
-          homebrew_clean: "True"
-          npm_prune: "True"
-          npm_clean: "True"
-          # os_swap: "True"
-          # 单盘布局会跳过 maximize-build-space，那时候不会再创建 swap LV；
-          # 把这里改回 False 才能保留镜像自带的 swap 文件（openwrt 链接大文件时有用）。
-          os_swap: "False"
+      # 【改】用等价的手写清理，替换 hugoalh/disk-space-optimizer-ghaction@v0.8.1
+      #
+      # 为什么换掉：Ubuntu 26.04 的 sudo 换成了 sudo-rs，它不支持 --preserve-env
+      #   （日志：sudo: preserving the entire environment is not supported, '--preserve-env' is ignored），
+      #   而这个 action 内部是用 `sudo --preserve-env pwsh main.ps1` 跑的，
+      #   环境变量过不去 → $Env:INPUT_ALLOWPRERELEASE 为空 →
+      #   [Boolean]::Parse('') 抛异常 → PowerShell 工具箱装不上 →
+      #   Import-Module 'hugoalh.GitHubActionsToolkit' 失败 →
+      #   整个 action 一步实际清理都没做（内部写了 continue-on-error，所以外层还是绿勾）。
+      #
+      # 手写版做的是同样的事：删大件、清 apt/docker 缓存，输出清理前后的 df 便于对比。
+      - name: 清理无用软件，腾出磁盘空间 (Clean up disk space)
+        run: |
+          echo "=== 清理前 ==="
+          df -hT / | tail -1
 
-           # ============================================================================
-      # 关键修改点 0：ubuntu-latest 现在会随机分配「单盘 145G」或「双盘 72G + 74G(/mnt)」
-      #   单盘布局下 /mnt 和 / 是同一个文件系统，maximize-build-space 会做两次 fallocate：
-      #     ① 根分区砍到只剩 root-reserve-mb
-      #     ② 再把 /mnt（其实是同一个根分区）砍到只剩 temp-reserve-mb（默认 100MB）
-      #   结果根分区只剩 100MB，apt 连 90MB 的 deb 都下不动，就是这次的报错。
-      #   所以：单盘时干脆跳过它（145G 足够），双盘时才合并。
-      # ============================================================================
+          # ① 删掉 runner 镜像里体积最大且本项目用不到的东西（约 25~30GB）
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android \
+                      /opt/hostedtoolcache/CodeQL /usr/local/share/boost || true
+
+          # ② Docker 镜像缓存
+          sudo docker image prune --all --force 2>/dev/null || true
+
+          # ③ APT 缓存与包列表
+          sudo apt-get clean || true
+          sudo rm -rf /var/lib/apt/lists/* /var/cache/apt/* || true
+
+          echo "=== 清理后 ==="
+          df -hT / | tail -1
+
+      # 【改】先探测磁盘布局：单盘(/mnt 与 / 同一文件系统) 还是 双盘(/dev/sdb1 挂 /mnt)
+      #   原因：maximize-build-space 会对 / 和 /mnt 各做一次 fallocate，
+      #        单盘时第二次会把根分区压到只剩 temp-reserve-mb（默认 100MB），
+      #        apt 连 90MB 的包都下不动，报 "not enough free space in /var/cache/apt/archives"。
       - name: 检测磁盘布局 (Detect disk layout)
         id: disk
         run: |
@@ -83,25 +102,27 @@ jobs:
           MNT_DEV="$(df -P /mnt 2>/dev/null | awk 'NR==2{print $1}')"
           if [ -z "$MNT_DEV" ] || [ "$MNT_DEV" = "$ROOT_DEV" ]; then
             echo "layout=single" >> "$GITHUB_OUTPUT"
-            echo "::notice::单盘布局（/mnt 与 / 同一文件系统），跳过 maximize-build-space，直接使用 145G 根盘"
+            echo "::notice::单盘布局，跳过 maximize-build-space，直接使用 145G 根盘"
           else
             echo "layout=dual" >> "$GITHUB_OUTPUT"
             echo "::notice::双盘布局，合并 / 与 /mnt"
           fi
 
+      # 【改】只在双盘时合并；参数也必须调整：
+      #   root-reserve-mb 必须 > temp-reserve-mb，否则单盘时第二次 fallocate 为负，pvcreate 失败
       - name: Freeing up disk space
         if: steps.disk.outputs.layout == 'dual'
         uses: easimon/maximize-build-space@master
         with:
-          root-reserve-mb: 8192      # 必须 > temp-reserve-mb，否则单盘时第二次 fallocate 为负
-          temp-reserve-mb: 4096      # 默认只有 100MB，是这次 / 被榨干的元凶
-          swap-size-mb: 2048         # 原来是 1（1MB swap 没有意义，多半是笔误）
+          root-reserve-mb: 8192
+          temp-reserve-mb: 4096
+          swap-size-mb: 2048
           remove-dotnet: "true"
           remove-android: "true"
           remove-haskell: "true"
           remove-codeql: "true"
           remove-docker-images: "true"
-          
+
       - name: Free up disk space complete
         run: |
           echo "Free up disk space complete"
@@ -109,17 +130,19 @@ jobs:
           df -hT
           echo "=============================================================================="
 
+      # ---------------------------------------------------------------------
+      # 编译依赖
+      # ---------------------------------------------------------------------
       - name: 下载编译所需的依赖 (Install the software packages required for compilation)
         run: |
-          # 1️⃣ 将临时目录指向 Runner 主磁盘，避开 /tmp tmpfs 限制
+          # 1️⃣ 把临时目录指向 Runner 主磁盘，避开新版镜像 /tmp 是 tmpfs 且有配额的问题
           export TMPDIR=$RUNNER_TEMP
           sudo mkdir -p $TMPDIR
-          # 2️⃣ 彻底清理 APT 缓存与包列表（释放 Inode 和残留空间）
+          # 2️⃣ 清理 APT 缓存与包列表
           sudo apt-get clean
           sudo rm -rf /var/lib/apt/lists/*
           sudo rm -rf /var/cache/apt/*
-          # 3️⃣ 更新源（CI 环境通常不需要 full-upgrade，耗时且易占满 Inode，建议注释）
-          # sudo apt-get full-upgrade -y
+          # 3️⃣ 更新源
           sudo apt-get update -y
 
           sudo apt-get install -y --no-install-recommends ack antlr3 asciidoc autoconf automake autopoint binutils bison build-essential \
@@ -130,21 +153,37 @@ jobs:
             ninja-build p7zip p7zip-full patch pkgconf python3 python3-pip python3-ply python3-docutils \
             python3-pyelftools qemu-utils re2c rsync scons squashfs-tools subversion swig texinfo uglifyjs \
             upx-ucl unzip vim wget xmlto xxd zlib1g-dev zstd
+          # 4️⃣ 关于 pahole：开启 CONFIG_KERNEL_DEBUG_INFO_BTF 后 **不需要** 在这里装 dwarves。
+          #    OpenWrt 的 KERNEL_DEBUG_INFO_BTF 带 select DWARVES（toolchain/dwarves），
+          #    构建时会自动编译 host 版 pahole，内核构建用的是
+          #    staging_dir/host/bin/pahole（PATH 里排在 /usr/bin 前面），
+          #    跟系统里有没有 pahole 无关。装了也无害，只是白白多下几 MB。
 
-          # 5️⃣ 安装后再次清理，防止后续步骤空间不足
           sudo apt-get clean
           sudo rm -rf /var/lib/apt/lists/* /var/cache/apt/*
 
+      # ---------------------------------------------------------------------
+      # 拉取源码
+      # ---------------------------------------------------------------------
+      # 【改】checkout@v4 → v5（v4 声明 node20，runner 已移除 node20，会被强制在 node24 上跑并告警）
       - name: 克隆当前仓库 (Clone current repo)
         uses: actions/checkout@v5
 
+      # 【改】要编 stable 版本，这里要传「tag」而不是「分支」：
+      #   branch 输入填 v25.12.2（tag 名以 https://github.com/immortalwrt/immortalwrt/tags 为准）
+      #   分支 openwrt-25.12 会一直往前跑，编出来就不是 25.12.2 那一刻的代码。
+      #   版本号由 mlx5-xdp.config 显式写入，所以不需要 git 历史/标签，保持浅克隆即可。
       - name: 克隆 openWRT 仓库 (Clone openWRT repo)
         uses: actions/checkout@v5
         with:
           repository: "${{inputs.owner}}/${{inputs.repo}}"
           ref: ${{inputs.branch}}
           path: openWRT
+          fetch-depth: 1
 
+      # ---------------------------------------------------------------------
+      # 配置注入
+      # ---------------------------------------------------------------------
       - name: 复制当前仓库的配置文件到 openWRT 仓库  (Copy current repo config to openWRT repo)
         run: cp -f .config diy.sh openWRT/
 
@@ -152,6 +191,8 @@ jobs:
         if: ${{inputs.isFiles == true}}
         run: cp -r files openWRT/files
 
+      # 注意：diy.sh 里如果有 sed feeds/luci/... 之类的命令，在这里不会生效（feeds 还没下载），
+      #       主题替换见下面 feeds 之后的那一步。另外不要把内核选项写进 diy.sh 了，统一交给 mlx5-xdp.config。
       - name: 运行 diy.sh (Run diy.sh)
         working-directory: openWRT
         run: |
@@ -162,17 +203,34 @@ jobs:
         working-directory: openWRT
         run: ./scripts/feeds update -a && ./scripts/feeds install -a
 
-      - name: 使用ssh连接编译环境，限时15分钟，可在连接后输入命令 `touch /tmp/keepalive` 保活 (Connect to the build environment using ssh) 
-        if: ${{inputs.ssh == true}}
-        uses: owenthereal/action-upterm@v2 #想让它真正可用：必须在 GitHub 账号里添加 SSH 公钥
-        continue-on-error: true
-        with:
-         limit-access-to-actor: true
-         wait-timeout-minutes: 20
-         upterm-server: wss://uptermd.upterm.dev     # ← 新增，改走 443
-      
-      
+      # diy.sh 里的 sed 跑在 feeds 之前，日志里会报 `sed: can't read feeds/luci/collections/luci/Makefile`，
+      # 也就是说主题替换从来没生效过。这里在 feeds 之后补一次。
+      - name: feeds 之后补做主题替换 (Apply theme patch after feeds)
+        working-directory: openWRT
+        run: |
+          if [ -f feeds/luci/collections/luci/Makefile ]; then
+            sed -i 's/luci-theme-bootstrap/luci-theme-argon/g' feeds/luci/collections/luci/Makefile
+            grep -n 'luci-theme' feeds/luci/collections/luci/Makefile || true
+          fi
 
+      # ---------------------------------------------------------------------
+      # 可选：SSH 调试
+      # ---------------------------------------------------------------------
+      # 需要先在 GitHub 账号里添加 SSH 公钥，否则 upterm 会因为拿不到公钥而启动失败
+      # （报 Failed to start the upterm session）。
+      # 如果你的网络封锁出站 22 端口（ssh -T git@github.com 也报 Connection closed），
+      # 把下面 upterm-server 那行取消注释，改走 wss://（443），然后用日志里的 ssh 命令连接。
+      - name: 使用ssh连接编译环境，限时15分钟 (Connect to the build environment using ssh)
+        if: ${{inputs.ssh == true}}
+        uses: owenthereal/action-upterm@v2
+        continue-on-error: true
+        timeout-minutes: 20
+        with:
+          limit-access-to-actor: true
+          wait-timeout-minutes: 15
+          # upterm-server: wss://uptermd.upterm.dev
+
+      # 勾了 SSH 时，把会话里生成/修改过的 .config 存档，方便事后对比
       - name: 启用ssh生成了.config后在编译前上传配置(Upload config before build)
         if: ${{inputs.ssh == true}}
         uses: actions/upload-artifact@v6
@@ -182,11 +240,118 @@ jobs:
             openWRT/.config
             openWRT/feeds.conf.default
           include-hidden-files: true
-          
+
+      # 没勾 SSH 时，用仓库里的 .config 覆盖（勾了 SSH 则以会话里改过的为准）
       - name: 再次复制当前仓库的配置文件到 openWRT 仓库  (Copy current repo config to openWRT repo)
         if: ${{inputs.ssh == false}}
         run: cp -f .config openWRT/
 
+      # ---------------------------------------------------------------------
+      # mlx5 / eBPF / XDP 配置注入（核心三步）
+      # ---------------------------------------------------------------------
+      # 第 1 步：注入软件包
+      #   必须在 make defconfig 之前。defconfig 的职责就是给选中的包补齐依赖；
+      #   放在它后面，就会出现 “XXX (no such package) / package/install Error 9”。
+      - name: 注入网卡/eBPF 包配置（defconfig 之前）
+        run: cat mlx5-xdp.config >> openWRT/.config
+
+      # 第 2 步：同步配置
+      #   原版没有这一步，导致 .config 与源码树不同步（日志里那行
+      #   "WARNING: your configuration is out of sync"），依赖包没被启用，
+      #   最后组装 rootfs 时报 no such package。
+      - name: 同步配置、补齐依赖 (Sync config and resolve dependencies)
+        working-directory: openWRT
+        run: make defconfig
+
+      # 第 3 步：注入内核选项
+      #   CONFIG_KERNEL_xxx 必须在 defconfig 之后，否则会被 defconfig 重写时丢掉。
+      #   直接写 CONFIG_XDP_SOCKETS=y 无效，OpenWrt 只认 CONFIG_KERNEL_ 前缀。
+      #   grep 要连 "# CONFIG_KERNEL_xxx is not set" 一起匹配，
+      #   否则 DEBUG_INFO_REDUCED 的那行会漏掉 → BTF 被内核 oldconfig 丢弃。
+      - name: 注入内核选项（defconfig 之后）
+        run: grep -E '^(# )?CONFIG_KERNEL_' mlx5-xdp.config >> openWRT/.config
+
+      # 第 4 步：按 branch 推导版本号，保证「标签 == 实际代码」
+      #   v25.12.2       → 25.12.2          + releases/25.12.2
+      #   openwrt-25.12  → 25.12 SNAPSHOT   + snapshots
+      #   main / master  → SNAPSHOT         + snapshots
+      # 版本号也必须在 defconfig 之后写入（否则会被 kconfig 重写丢掉）。
+      - name: 按 branch 写入版本号 (Derive version from ref)
+        run: |
+          BRANCH="${{ inputs.branch }}"
+          case "$BRANCH" in
+            v[0-9]*.[0-9]*.[0-9]*)
+              RAW="${BRANCH#v}"          # 25.12.2 / 25.12.2-immortalwrt
+              CORE="${RAW%%-*}"          # 25.12.2
+              VER="$RAW"
+              REPO="https://downloads.immortalwrt.org/releases/${CORE}"
+              ;;
+            v[0-9]*.[0-9]*)
+              # 万一 tag 只有两段（如 v25.12），也按 release 处理
+              VER="${BRANCH#v}"
+              REPO="https://downloads.immortalwrt.org/releases/${VER}"
+              ;;
+            openwrt-[0-9]*.[0-9]*)
+              VER="${BRANCH#openwrt-} SNAPSHOT"   # 25.12 SNAPSHOT
+              REPO="https://downloads.immortalwrt.org/snapshots"
+              ;;
+            *)
+              VER="SNAPSHOT"
+              REPO="https://downloads.immortalwrt.org/snapshots"
+              ;;
+          esac
+          CODE="$(git -C openWRT rev-parse --short HEAD 2>/dev/null || echo '')"
+          {
+            echo "CONFIG_VERSION_NUMBER=\"$VER\""
+            echo "CONFIG_VERSION_CODE=\"$CODE\""
+            echo "CONFIG_VERSION_REPO=\"$REPO\""
+            echo "CONFIG_VERSION_DIST=\"ImmortalWrt\""
+          } >> openWRT/.config
+          echo "ref     = $BRANCH"
+          echo "VERSION = $VER"
+          echo "REPO    = $REPO"
+          echo "CODE    = $CODE"
+
+      # 校验：确认注入没被丢弃（包不存在 / 依赖不满足时会静默消失）
+      - name: 校验配置注入结果
+        working-directory: openWRT
+        run: |
+          echo "--- 软件包 ---"
+          miss=0
+          for p in kmod-mlx5-core kmod-mlxfw ethtool lm-sensors pciutils \
+                   irqbalance bpftool-full libxdp xdp-loader xdp-filter xdpdump \
+                   tc-bpf kmod-sched-core kmod-sched-bpf kmod-xdp-sockets-diag \
+                   kmod-veth kmod-nft-queue kmod-nfnetlink-queue; do
+            if grep -q "^CONFIG_PACKAGE_$p=y" .config; then
+              echo "OK   $p"
+            else
+              echo "MISS $p"; miss=1
+            fi
+          done
+          echo "--- 构建开关 ---"
+          grep -q '^CONFIG_DEVEL=y' .config && echo "OK   DEVEL" || { echo "MISS DEVEL"; miss=1; }
+          grep -q '^CONFIG_BPF_TOOLCHAIN_HOST=y' .config && echo "OK   BPF_TOOLCHAIN_HOST" || { echo "MISS BPF_TOOLCHAIN_HOST"; miss=1; }
+          echo "--- 内核选项 ---"
+          grep -E '^CONFIG_KERNEL_(BPF_SYSCALL|BPF_JIT|BPF_JIT_ALWAYS_ON|CGROUP_BPF|BPF_EVENTS|XDP_SOCKETS|NET_CLS_BPF|NET_ACT_BPF|NET_SCH_INGRESS|DEBUG_INFO|DEBUG_INFO_BTF)=' .config || miss=1
+          # DEBUG_INFO_REDUCED 必须是关的，否则 BTF 会被内核丢弃
+          if grep -q '^CONFIG_KERNEL_DEBUG_INFO_REDUCED=y' .config; then
+            echo "!! DEBUG_INFO_REDUCED 仍是 y，BTF 会失效"; miss=1
+          else
+            echo "OK   DEBUG_INFO_REDUCED 未启用"
+          fi
+          echo "--- 版本号 ---"
+          if grep -q '^CONFIG_VERSION_NUMBER="' .config; then
+            grep '^CONFIG_VERSION_' .config
+          else
+            echo "MISS CONFIG_VERSION_NUMBER（镜像会显示 Snapshots）"; miss=1
+          fi
+          # 驱动是硬需求：没有 mlx5 就编不出能用的固件，直接失败
+          grep -q '^CONFIG_PACKAGE_kmod-mlx5-core=y' .config || { echo "!! 缺少 mlx5 驱动"; exit 1; }
+          exit $miss
+
+      # ---------------------------------------------------------------------
+      # 编译
+      # ---------------------------------------------------------------------
       - name: 多线程编译 openWRT (Build openWRT multithreading)
         if: ${{inputs.multithreading == true}}
         working-directory: openWRT
@@ -197,6 +362,19 @@ jobs:
         working-directory: openWRT
         run: make -j1 V=s
 
+      # 编译后确认内核里真的有 XDP/BPF（注意：这里是不带 KERNEL_ 前缀的真实内核符号）
+      - name: 确认内核已编入 XDP/BPF
+        if: always()
+        working-directory: openWRT
+        run: |
+          KCFG=$(ls build_dir/target-*/linux-*/linux-*/.config 2>/dev/null | head -1)
+          [ -n "$KCFG" ] || { echo "没有找到内核 .config（可能没编译到内核阶段）"; exit 0; }
+          grep -E '^CONFIG_(MLX5_CORE|BPF_SYSCALL|BPF_JIT|BPF_JIT_ALWAYS_ON|CGROUP_BPF|BPF_EVENTS|NET_CLS_BPF|NET_ACT_BPF|NET_SCH_INGRESS|XDP_SOCKETS|DEBUG_INFO|DEBUG_INFO_BTF)=' "$KCFG" || true
+          echo "--- 关键点检查 ---"
+          grep -q '^CONFIG_DEBUG_INFO_BTF=y' "$KCFG" && echo "OK   BTF 已编入" || echo "!! BTF 没编进去（检查 DEBUG_INFO_REDUCED 是否被关掉）"
+          grep -q '^CONFIG_DEBUG_INFO_REDUCED=y' "$KCFG" && echo "!! DEBUG_INFO_REDUCED=y，BTF 会被丢弃" || true
+
+      # 【改】upload-artifact@v4 → v6（v4/v5 都还是 node20）
       - name: 上传编译结果到 Artifact (Upload build result to Artifact)
         uses: actions/upload-artifact@v6
         with:
